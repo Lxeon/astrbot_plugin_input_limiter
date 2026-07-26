@@ -20,7 +20,7 @@
             "type": "string",
             "default": "",
             "_special": "select_persona",
-            "hint": "必须与 /inputlimiter 显示的『识别到的人格名』完全一致。下拉若不可用就手填人格名。"
+            "hint": "与 /inputlimiter 显示的『识别到的人格名』一致即可（不区分大小写）。下拉若不可用就手填人格名。注意：webchat 平台的默认人格识别为 _chatui_default_。"
           },
           "enabled": {
             "description": "启用该规则",
@@ -32,7 +32,7 @@
             "description": "最大字符数",
             "type": "int",
             "default": 100,
-            "hint": "文本总长度超过此值时截断"
+            "hint": "文本总长度超过此值时截断。截断后缀不计入此上限，实际最长会超出后缀的几个字。"
           },
           "suffix": {
             "description": "截断后缀",
@@ -41,10 +41,10 @@
             "hint": "截断后追加的提示，留空则不追加"
           },
           "skip_admin": {
-            "description": "管理员豁免",
+            "description": "全局管理员豁免",
             "type": "bool",
             "default": false,
-            "hint": "开启后群管理员/群主不受限制"
+            "hint": "开启后 AstrBot 全局管理员（admins_id 中的人）不受限制。注意：不是群管理员/群主。"
           }
         }
       }

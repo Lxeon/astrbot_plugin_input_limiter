@@ -1,3 +1,5 @@
+import time
+
 import astrbot.api.message_components as Comp
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
@@ -12,9 +14,15 @@ class InputLimiter(Star):
     提供 /inputlimiter 诊断指令 + debug_log 开关，使生效情况可观测。
     """
 
+    # 人格识别结果缓存（按 umo），避免每条消息都查 3 次数据库。
+    # TTL 取 8 秒：/persona 切换人格后最坏 8 秒内生效。
+    _PERSONA_CACHE_TTL = 8.0
+    _PERSONA_CACHE_MAX = 1000
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
+        self._persona_cache: dict = {}  # umo -> (persona_name, monotonic_ts)
 
     # ─── 配置读取 ─────────────────────────────────────────────
 
@@ -43,12 +51,28 @@ class InputLimiter(Star):
 
     async def _resolve_persona_name(self, event: AstrMessageEvent) -> str:
         umo = getattr(event, "unified_msg_origin", "") or ""
+        if not umo:
+            return ""
+
+        now = time.monotonic()
+        cached = self._persona_cache.get(umo)
+        if cached and now - cached[1] < self._PERSONA_CACHE_TTL:
+            return cached[0]
+
+        name = await self._resolve_persona_name_uncached(event, umo)
+
+        if len(self._persona_cache) >= self._PERSONA_CACHE_MAX:
+            self._persona_cache.clear()
+        self._persona_cache[umo] = (name, now)
+        return name
+
+    async def _resolve_persona_name_uncached(self, event: AstrMessageEvent, umo: str) -> str:
         pm = getattr(self.context, "persona_manager", None)
         cm = getattr(self.context, "conversation_manager", None)
 
         conv_persona_id = None
         try:
-            if cm and umo:
+            if cm:
                 cid = await cm.get_curr_conversation_id(umo)
                 if cid:
                     conv = await cm.get_conversation(umo, cid)
@@ -59,14 +83,14 @@ class InputLimiter(Star):
         provider_settings = None
         try:
             acm = getattr(self.context, "astrbot_config_mgr", None)
-            if acm and umo:
+            if acm:
                 cfg = acm.get_conf(umo)
                 provider_settings = cfg.get("provider_settings") if cfg else None
         except Exception as e:
             self._log(f"读取配置文件异常: {e}")
 
         try:
-            if pm and hasattr(pm, "resolve_selected_persona") and umo:
+            if pm and hasattr(pm, "resolve_selected_persona"):
                 res = await pm.resolve_selected_persona(
                     umo=umo,
                     conversation_persona_id=conv_persona_id,
@@ -79,7 +103,7 @@ class InputLimiter(Star):
             self._log(f"resolve_selected_persona 异常: {e}")
 
         try:
-            if pm and hasattr(pm, "get_default_persona_v3") and umo:
+            if pm and hasattr(pm, "get_default_persona_v3"):
                 dp = await pm.get_default_persona_v3(umo)
                 name = getattr(dp, "name", None) or (dp.get("name") if isinstance(dp, dict) else None)
                 if name:
@@ -144,6 +168,11 @@ class InputLimiter(Star):
         if not rules:
             return
 
+        # 斜杠指令（如 /persona、/inputlimiter）不截断，避免截短后指令无法识别
+        text = (event.message_str or "").strip()
+        if text.startswith("/") or text.startswith("／"):
+            return
+
         persona_name = await self._resolve_persona_name(event)
         rule = self._match_rule(persona_name)
 
@@ -162,6 +191,10 @@ class InputLimiter(Star):
             max_length = int(rule.get("max_length", 100))
         except (TypeError, ValueError):
             max_length = 100
+            self._log(
+                f"人格=「{persona_name}」 max_length 配置非法 "
+                f"({rule.get('max_length')!r})，已回退为 100"
+            )
         if max_length <= 0:
             return
 
@@ -173,7 +206,9 @@ class InputLimiter(Star):
 
     @filter.command("inputlimiter")
     async def inputlimiter_diag(self, event: AstrMessageEvent):
-        """诊断：查看规则、当前会话人格名、命中情况"""
+        """诊断：查看规则、当前会话人格名、命中情况（仅 AstrBot 全局管理员可用）"""
+        if not event.is_admin():
+            return
         rules = self._rules()
         lines = [f"🔧 InputLimiter 诊断 | debug_log={'开' if self._debug() else '关'}"]
         lines.append(f"规则数: {len(rules)}")

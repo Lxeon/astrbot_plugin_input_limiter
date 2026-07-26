@@ -1,7 +1,7 @@
 name: astrbot_plugin_input_limiter
 display_name: 输入长度限制器
-desc: 按人格规则截断超长用户消息，节约 token。支持每个人格独立开关、字数上限、截断后缀、管理员豁免，配置自动持久化。
+desc: 按人格规则截断超长用户消息，节约 token。支持每个人格独立开关、字数上限、截断后缀、全局管理员豁免，配置自动持久化。
 short_desc: 按人格限制输入长度，超长自动截断，节约 token
 author: 星野彗星
-version: 1.0.0
+version: 1.1.0
 repo: https://github.com/lxeon/astrbot_plugin_input_limiter
