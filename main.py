@@ -15,9 +15,12 @@ class InputLimiter(Star):
     """
 
     # 人格识别结果缓存（按 umo），避免每条消息都查 3 次数据库。
-    # TTL 取 8 秒：/persona 切换人格后最坏 8 秒内生效。
-    _PERSONA_CACHE_TTL = 8.0
+    # TTL 可在配置 cache_ttl 调整，默认 8 秒；识别失败（空结果）不缓存。
+    _DEFAULT_CACHE_TTL = 8.0
     _PERSONA_CACHE_MAX = 1000
+    # 斜杠指令豁免的最大长度：指令本体足够用，超长的 "/" 消息仍截断，
+    # 防止用 "/" + 长文绕过限制。
+    _SLASH_BYPASS_MAX = 50
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -37,11 +40,20 @@ class InputLimiter(Star):
         if self._debug():
             logger.info(f"[InputLimiter] {msg}")
 
-    def _match_rule(self, persona_name: str):
+    def _cache_ttl(self) -> float:
+        try:
+            ttl = float(self.config.get("cache_ttl", self._DEFAULT_CACHE_TTL))
+        except (TypeError, ValueError):
+            ttl = self._DEFAULT_CACHE_TTL
+        return max(ttl, 0.0)
+
+    def _match_rule(self, persona_name: str, rules: list | None = None):
         if not persona_name:
             return None
+        if rules is None:
+            rules = self._rules()
         key = persona_name.strip().lower()
-        for r in self._rules():
+        for r in rules:
             p = str(r.get("persona", "")).strip()
             if p and p.lower() == key:
                 return r
@@ -56,13 +68,18 @@ class InputLimiter(Star):
 
         now = time.monotonic()
         cached = self._persona_cache.get(umo)
-        if cached and now - cached[1] < self._PERSONA_CACHE_TTL:
+        if cached and now - cached[1] < self._cache_ttl():
             return cached[0]
 
         name = await self._resolve_persona_name_uncached(event, umo)
 
+        if not name:
+            # 识别失败/异常（空结果）不缓存，下一条消息立即重试
+            return name
         if len(self._persona_cache) >= self._PERSONA_CACHE_MAX:
-            self._persona_cache.clear()
+            # 逐出最旧一条，避免整体清空造成数据库请求突增
+            oldest = min(self._persona_cache, key=lambda k: self._persona_cache[k][1])
+            self._persona_cache.pop(oldest, None)
         self._persona_cache[umo] = (name, now)
         return name
 
@@ -78,7 +95,7 @@ class InputLimiter(Star):
                     conv = await cm.get_conversation(umo, cid)
                     conv_persona_id = getattr(conv, "persona_id", None)
         except Exception as e:
-            self._log(f"读取会话人格异常: {e}")
+            logger.warning(f"[InputLimiter] 读取会话人格异常，本次放行: {e}")
 
         provider_settings = None
         try:
@@ -87,7 +104,7 @@ class InputLimiter(Star):
                 cfg = acm.get_conf(umo)
                 provider_settings = cfg.get("provider_settings") if cfg else None
         except Exception as e:
-            self._log(f"读取配置文件异常: {e}")
+            logger.warning(f"[InputLimiter] 读取配置文件异常，本次放行: {e}")
 
         try:
             if pm and hasattr(pm, "resolve_selected_persona"):
@@ -100,7 +117,7 @@ class InputLimiter(Star):
                 if res and res[0]:
                     return str(res[0])
         except Exception as e:
-            self._log(f"resolve_selected_persona 异常: {e}")
+            logger.warning(f"[InputLimiter] resolve_selected_persona 异常，本次放行: {e}")
 
         try:
             if pm and hasattr(pm, "get_default_persona_v3"):
@@ -109,7 +126,7 @@ class InputLimiter(Star):
                 if name:
                     return str(name)
         except Exception as e:
-            self._log(f"get_default_persona_v3 异常: {e}")
+            logger.warning(f"[InputLimiter] get_default_persona_v3 异常，本次放行: {e}")
 
         return ""
 
@@ -129,9 +146,12 @@ class InputLimiter(Star):
 
         remaining = max_length
         new_chain = []
+        truncated = False
+        suffix_added = False
         for comp in message_chain:
             if isinstance(comp, Comp.Plain):
                 if remaining <= 0:
+                    truncated = True
                     continue
                 if len(comp.text) <= remaining:
                     new_chain.append(comp)
@@ -139,8 +159,18 @@ class InputLimiter(Star):
                 else:
                     new_chain.append(Comp.Plain(text=comp.text[:remaining] + suffix))
                     remaining = 0
+                    truncated = True
+                    suffix_added = True
             else:
                 new_chain.append(comp)
+
+        # 边界情况：超长部分恰好从某个 Plain 组件边界开始，上面的 else 分支不会触发，
+        # 需要给最后一个 Plain 组件补上后缀，否则用户/LLM 不知道文本被截断过。
+        if truncated and not suffix_added and suffix:
+            for i in range(len(new_chain) - 1, -1, -1):
+                if isinstance(new_chain[i], Comp.Plain):
+                    new_chain[i] = Comp.Plain(text=new_chain[i].text + suffix)
+                    break
 
         new_str = "".join(c.text for c in new_chain if isinstance(c, Comp.Plain))
 
@@ -168,13 +198,16 @@ class InputLimiter(Star):
         if not rules:
             return
 
-        # 斜杠指令（如 /persona、/inputlimiter）不截断，避免截短后指令无法识别
+        # 斜杠指令（如 /persona、/inputlimiter）不截断，避免截短后指令无法识别；
+        # 但超过 _SLASH_BYPASS_MAX 的 "/" 消息仍截断，防止 "/" + 长文绕过限制
         text = (event.message_str or "").strip()
-        if text.startswith("/") or text.startswith("／"):
+        if (
+            text.startswith("/") or text.startswith("／")
+        ) and len(text) <= self._SLASH_BYPASS_MAX:
             return
 
         persona_name = await self._resolve_persona_name(event)
-        rule = self._match_rule(persona_name)
+        rule = self._match_rule(persona_name, rules)
 
         if not rule:
             self._log(f"人格=「{persona_name or '(空)'}」 无匹配规则，放行")
@@ -196,9 +229,16 @@ class InputLimiter(Star):
                 f"({rule.get('max_length')!r})，已回退为 100"
             )
         if max_length <= 0:
+            self._log(
+                f"人格=「{persona_name}」 max_length={max_length} <= 0，规则不生效，放行"
+            )
             return
 
         suffix = rule.get("suffix", "...(已截断)")
+        if not isinstance(suffix, str):
+            # 配置里 suffix 可能被存成 null 或非字符串，直接拼接会抛 TypeError
+            self._log(f"人格=「{persona_name}」 suffix 类型非法 ({suffix!r})，已矫正")
+            suffix = "...(已截断)" if suffix is None else str(suffix)
         self._log(f"人格=「{persona_name}」 命中且启用，上限 {max_length}，开始判断截断")
         self._apply_truncate(event, max_length, suffix)
 
@@ -222,10 +262,24 @@ class InputLimiter(Star):
         if not rules:
             lines.append("  ⚠️ 没有任何规则 -> 插件不会对任何会话生效，请先添加规则。")
 
+        # 重复人格规则检测：同名规则只有先出现的那条生效
+        seen: dict = {}
+        dups = []
+        for i, r in enumerate(rules, 1):
+            key = str(r.get("persona", "")).strip().lower()
+            if not key:
+                continue
+            if key in seen:
+                dups.append(f"[{seen[key]}] 与 [{i}]（人格=「{r.get('persona')}」）")
+            else:
+                seen[key] = i
+        if dups:
+            lines.append("  ⚠️ 重复人格规则: " + "、".join(dups) + "，实际生效的是先出现的那条。")
+
         persona_name = await self._resolve_persona_name(event)
         lines.append(f"当前会话识别到的人格名: 「{persona_name or '(空/识别失败)'}」")
 
-        rule = self._match_rule(persona_name)
+        rule = self._match_rule(persona_name, rules)
         if not rules:
             lines.append("命中: 无规则")
         elif not rule:

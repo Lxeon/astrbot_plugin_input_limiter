@@ -5,6 +5,12 @@
     "default": false,
     "hint": "默认关闭。排错时打开，会在控制台打印人格识别/匹配/截断详情；排错完成后保持关闭以免刷屏。"
   },
+  "cache_ttl": {
+    "description": "人格识别缓存秒数",
+    "type": "int",
+    "default": 8,
+    "hint": "同一会话在此秒数内不重复查询人格。调小则 /persona 切换后生效更快但更频繁查库；识别失败的结果不会被缓存。"
+  },
   "rules": {
     "type": "template_list",
     "description": "人格输入限制规则",
